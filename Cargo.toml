@@ -1,0 +1,30 @@
+[package]
+name = "jafra-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Node-local Jafra JFR collector"
+license = "Apache-2.0"
+
+[dependencies]
+bytes = "1"
+hex = "0.4"
+notify = { version = "8", default-features = false, features = ["macos_kqueue"] }
+prost = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = "0.1"
+tonic = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+walkdir = "2"
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
+tonic = "0.12"
