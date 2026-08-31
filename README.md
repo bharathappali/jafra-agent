@@ -1,6 +1,6 @@
 # Jafra Agent
 
-`jafra-agent` version `0.1.0` is a node-local Rust collector. It discovers
+`jafra-agent` version `0.0.1` is a node-local Rust collector. It discovers
 JFR files under `/jfr-data/<namespace>/<podUID>/<container>/`, treats the
 68-byte JFR header as the source of truth for chunk finalization, and either
 logs finalized chunks or streams them to `jafra-analyzer`. The init container
@@ -19,7 +19,7 @@ works without a container as long as `protoc` is on `PATH`.
 ```bash
 cargo test
 cargo build --release
-docker build -f jafra-agent/Dockerfile -t quay.io/bharathappali/jafra-agent:0.1.0 .
+docker build -f jafra-agent/Dockerfile -t quay.io/bharathappali/jafra-agent:0.0.1 .
 ```
 
 Build the container from the repository root so `contracts/jafra.proto` is
@@ -49,7 +49,7 @@ Deletion requires all of:
 ## Deploy
 
 ```bash
-kind load docker-image quay.io/bharathappali/jafra-agent:0.1.0 --name jafra
+kind load docker-image quay.io/bharathappali/jafra-agent:0.0.1 --name jafra
 kubectl apply -f deploy/agent/rbac.yaml
 kubectl apply -f deploy/agent/daemonset.yaml
 kubectl logs -n jafra-system daemonset/jafra-agent -f
