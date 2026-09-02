@@ -28,11 +28,12 @@ pub struct GrpcTransport {
 impl GrpcTransport {
     pub async fn connect(
         config: &Config,
+        metrics: Arc<Metrics>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Arc::new(Self {
             endpoint: config.analyzer_endpoint.clone(),
             client: Mutex::new(None),
-            metrics: crate::metrics::Metrics::new(),
+            metrics,
         }))
     }
 

@@ -1,11 +1,12 @@
 # Jafra Agent
 
-`jafra-agent` version `0.0.1` is a node-local Rust collector. It discovers
-JFR files under `/jfr-data/<namespace>/<podUID>/<container>/`, treats the
-68-byte JFR header as the source of truth for chunk finalization, and either
-logs finalized chunks or streams them to `jafra-analyzer`. The init container
-writes `.jafra-identity.json` in that directory so the agent can send the
-Kubernetes pod name with each chunk.
+`jafra-agent` version `0.0.2` is a node-local Rust collector. It discovers
+JFR files under the kubelet emptyDir path for `jafra-recordings`
+(`/var/lib/kubelet/pods/<pod-uid>/volumes/kubernetes.io~empty-dir/jafra-recordings/<namespace>/<podUID>/<container>/`),
+treats the 68-byte JFR header as the source of truth for chunk finalization,
+and either logs finalized chunks or streams them to `jafra-analyzer`. The init
+container writes `.jafra-identity.json` in that directory so the agent can send
+the Kubernetes pod name with each chunk.
 
 In `grpc` mode, after every chunk in a *rotated* file is `ACCEPTED` or
 `DUPLICATE`, the agent deletes that source file. The live file the JVM is
@@ -19,7 +20,7 @@ works without a container as long as `protoc` is on `PATH`.
 ```bash
 cargo test
 cargo build --release
-docker build -f jafra-agent/Dockerfile -t quay.io/bharathappali/jafra-agent:0.0.1 .
+docker build -f jafra-agent/Dockerfile -t quay.io/bharathappali/jafra-agent:0.0.2 .
 ```
 
 Build the container from the repository root so `contracts/jafra.proto` is
@@ -49,7 +50,7 @@ Deletion requires all of:
 ## Deploy
 
 ```bash
-kind load docker-image quay.io/bharathappali/jafra-agent:0.0.1 --name jafra
+kind load docker-image quay.io/bharathappali/jafra-agent:0.0.2 --name jafra
 kubectl apply -f deploy/agent/rbac.yaml
 kubectl apply -f deploy/agent/daemonset.yaml
 kubectl logs -n jafra-system daemonset/jafra-agent -f
@@ -61,9 +62,14 @@ The DaemonSet defaults to `log-only`. After the analyzer is up:
 kubectl set env daemonset/jafra-agent -n jafra-system JAFRA_MODE=grpc
 ```
 
-The DaemonSet mounts `/var/lib/jafra/recordings` read-write so it can delete
-closed files. It runs only on Linux nodes, including Kind control-plane
-nodes via a taint toleration.
+The DaemonSet mounts `/var/lib/kubelet/pods` read-write so it can read and
+delete closed recordings. It runs only on Linux nodes, including Kind
+control-plane nodes via a taint toleration.
+
+Environment:
+
+- `JAFRA_RECORDING_ROOT` (default `/var/lib/kubelet/pods`)
+- `JAFRA_RECORDING_VOLUME` (default `jafra-recordings`)
 
 ## Intentional limitations
 
@@ -72,10 +78,12 @@ nodes via a taint toleration.
   identity store.
 - Watcher events only wake a rescan; finalization is decided from the JFR
   header, never from a single inotify event.
+- The agent watches the kubelet pod tree shallowly for new Pods and attaches
+  recursive inotify watches only to `jafra-recordings` emptyDir roots.
 - Continuous JFR writes generate many inotify events. The 1024-deep wake
   channel can overflow, which forces a full rescan. The
   `incomplete_chunks` metric currently counts every growing-tail observation,
   not unique incomplete chunks.
-- `hostPath` is required for the node-local demonstration.
-- Recording directories are mode `0777` so the unprivileged agent can delete
-  files the JVM wrote as another UID. That is demonstration-only.
+- The agent DaemonSet needs host access to kubelet pod volumes. On OpenShift
+  this is granted via the custom `jafra-agent` SCC; workloads use `emptyDir`
+  only and do not need elevated SCC.

@@ -13,6 +13,7 @@ pub enum AgentMode {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub recording_root: PathBuf,
+    pub recording_volume_name: String,
     pub mode: AgentMode,
     pub node_name: String,
     pub cluster_id: String,
@@ -59,7 +60,8 @@ impl Config {
         }
 
         Ok(Self {
-            recording_root: PathBuf::from(get("JAFRA_RECORDING_ROOT", "/jfr-data")),
+            recording_root: PathBuf::from(get("JAFRA_RECORDING_ROOT", "/var/lib/kubelet/pods")),
+            recording_volume_name: get("JAFRA_RECORDING_VOLUME", "jafra-recordings"),
             mode,
             node_name: get("JAFRA_NODE_NAME", "unknown-node"),
             cluster_id: get("JAFRA_CLUSTER_ID", "local-demo"),

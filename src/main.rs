@@ -19,16 +19,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         event = "jafra_agent_start",
         mode = ?config.mode,
         root = %config.recording_root.display(),
+        volume = %config.recording_volume_name,
         node = %config.node_name,
         "starting Jafra agent"
     );
-    tokio::fs::create_dir_all(&config.recording_root).await?;
     let state = Arc::new(Mutex::new(CollectorState::default()));
     let metrics = Metrics::new();
-    let transport = build_transport(&config).await?;
+    let transport = build_transport(&config, metrics.clone()).await?;
     let (wake_tx, wake_rx) = tokio::sync::mpsc::channel(1024);
-    let mut watcher = jafra_agent::watcher::spawn_watcher(config.recording_root.clone(), wake_tx)?;
-    jafra_agent::watcher::watch_if_needed(&mut watcher, &config.recording_root);
+    let recording_watcher = Arc::new(std::sync::Mutex::new(
+        jafra_agent::watcher::RecordingWatcher::new(
+            config.recording_root.clone(),
+            config.recording_volume_name.clone(),
+            wake_tx,
+        )?,
+    ));
     let metrics_clone = metrics.clone();
     let node = config.node_name.clone();
     tokio::spawn(async move {
@@ -43,6 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         state,
         metrics,
         transport,
+        recording_watcher,
         wake_rx,
     ));
     tokio::signal::ctrl_c().await?;

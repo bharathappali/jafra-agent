@@ -108,6 +108,7 @@ fn sample_file() -> (tempfile::TempDir, ChunkKey, RecordingIdentity) {
 fn test_config(endpoint: String) -> Config {
     Config {
         recording_root: "/tmp".into(),
+        recording_volume_name: "jafra-recordings".into(),
         mode: AgentMode::Grpc,
         node_name: "worker-1".into(),
         cluster_id: "local-demo".into(),

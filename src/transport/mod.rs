@@ -32,9 +32,10 @@ pub trait Transport: Send + Sync {
 
 pub async fn build_transport(
     config: &Config,
+    metrics: Arc<crate::metrics::Metrics>,
 ) -> Result<Arc<dyn Transport>, Box<dyn std::error::Error + Send + Sync>> {
     match config.mode {
         AgentMode::LogOnly => Ok(Arc::new(log_only::LogOnlyTransport)),
-        AgentMode::Grpc => Ok(grpc::GrpcTransport::connect(config).await?),
+        AgentMode::Grpc => Ok(grpc::GrpcTransport::connect(config, metrics).await?),
     }
 }
