@@ -98,13 +98,17 @@ fn path_metadata_extraction_and_traversal() {
 #[test]
 fn multiple_pod_directories() {
     let dir = tempdir().unwrap();
-    let one = dir.path().join("default/uid-a/auth-cache");
-    let two = dir.path().join("default/uid-b/auth-cache");
+    let one = dir
+        .path()
+        .join("pod-a/volumes/kubernetes.io~empty-dir/jafra-recordings/default/uid-a/auth-cache");
+    let two = dir
+        .path()
+        .join("pod-b/volumes/kubernetes.io~empty-dir/jafra-recordings/default/uid-b/auth-cache");
     fs::create_dir_all(&one).unwrap();
     fs::create_dir_all(&two).unwrap();
     fs::write(one.join("profile-0.jfr"), [0u8; 4]).unwrap();
     fs::write(two.join("profile-0.jfr"), [0u8; 4]).unwrap();
-    let files = discover_jfr_files(dir.path()).unwrap();
+    let files = discover_jfr_files(dir.path(), "jafra-recordings").unwrap();
     assert_eq!(files.len(), 2);
 }
 
@@ -136,7 +140,9 @@ impl Transport for BlockingTransport {
 #[tokio::test]
 async fn bounded_worker_concurrency() {
     let dir = tempdir().unwrap();
-    let pod = dir.path().join("default/uid/app");
+    let pod = dir
+        .path()
+        .join("pod-uid/volumes/kubernetes.io~empty-dir/jafra-recordings/default/uid/app");
     fs::create_dir_all(&pod).unwrap();
     for index in 0..6 {
         let mut bytes = Vec::new();
@@ -145,6 +151,7 @@ async fn bounded_worker_concurrency() {
     }
     let config = Config {
         recording_root: dir.path().to_path_buf(),
+        recording_volume_name: "jafra-recordings".into(),
         mode: AgentMode::LogOnly,
         node_name: "test".into(),
         cluster_id: "local-demo".into(),
@@ -159,7 +166,16 @@ async fn bounded_worker_concurrency() {
         };
     let state = Arc::new(Mutex::new(CollectorState::default()));
     let metrics = Metrics::new();
-    rescan(&config, &state, &metrics).await;
+    let (wake_tx, _wake_rx) = tokio::sync::mpsc::channel(1);
+    let watcher = Arc::new(std::sync::Mutex::new(
+        jafra_agent::watcher::RecordingWatcher::new(
+            dir.path().to_path_buf(),
+            "jafra-recordings".into(),
+            wake_tx,
+        )
+        .unwrap(),
+    ));
+    rescan(&config, &state, &metrics, &watcher).await;
     assert!(state.lock().await.queued_len() >= 6);
 }
 

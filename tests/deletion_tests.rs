@@ -5,7 +5,7 @@ use std::time::Duration;
 use jafra_agent::config::{AgentMode, Config};
 use jafra_agent::jfr::header::{write_finalized_header, write_placeholder_header, HEADER_SIZE};
 use jafra_agent::metrics::Metrics;
-use jafra_agent::path::identity_from_path;
+use jafra_agent::path::identity_from_recording_path;
 use jafra_agent::state::CollectorState;
 use jafra_agent::worker::try_reclaim_closed_sources;
 use tempfile::tempdir;
@@ -30,6 +30,7 @@ fn write_open_tail() -> Vec<u8> {
 fn config(root: &std::path::Path, mode: AgentMode, delete: bool) -> Config {
     Config {
         recording_root: root.to_path_buf(),
+        recording_volume_name: "jafra-recordings".into(),
         mode,
         node_name: "test".into(),
         cluster_id: "local-demo".into(),
@@ -44,10 +45,15 @@ fn config(root: &std::path::Path, mode: AgentMode, delete: bool) -> Config {
     }
 }
 
+fn recording_dir(root: &std::path::Path, kube_pod_uid: &str) -> std::path::PathBuf {
+    root.join(kube_pod_uid)
+        .join("volumes/kubernetes.io~empty-dir/jafra-recordings/default/uid/app")
+}
+
 #[tokio::test]
 async fn deletes_closed_acked_file_once_a_newer_rotation_exists() {
     let dir = tempdir().unwrap();
-    let pod = dir.path().join("default/uid/app");
+    let pod = recording_dir(dir.path(), "kube-pod-uid");
     fs::create_dir_all(&pod).unwrap();
     let older = write_closed_chunk();
     let newer = write_closed_chunk();
@@ -57,7 +63,7 @@ async fn deletes_closed_acked_file_once_a_newer_rotation_exists() {
     fs::write(&path1, &newer).unwrap();
 
     let state = Arc::new(Mutex::new(CollectorState::default()));
-    let identity = identity_from_path(dir.path(), &path0).unwrap();
+    let identity = identity_from_recording_path(&path0, "jafra-recordings").unwrap();
     {
         let mut locked = state.lock().await;
         let file = locked.file_mut(&path0, identity);
@@ -74,13 +80,13 @@ async fn deletes_closed_acked_file_once_a_newer_rotation_exists() {
 #[tokio::test]
 async fn keeps_the_live_file_when_it_is_the_newest_rotation() {
     let dir = tempdir().unwrap();
-    let pod = dir.path().join("default/uid/app");
+    let pod = recording_dir(dir.path(), "kube-pod-uid");
     fs::create_dir_all(&pod).unwrap();
     let bytes = write_closed_chunk();
     let path0 = pod.join("profile-0.jfr");
     fs::write(&path0, &bytes).unwrap();
     let state = Arc::new(Mutex::new(CollectorState::default()));
-    let identity = identity_from_path(dir.path(), &path0).unwrap();
+    let identity = identity_from_recording_path(&path0, "jafra-recordings").unwrap();
     {
         let mut locked = state.lock().await;
         let file = locked.file_mut(&path0, identity);
@@ -96,14 +102,14 @@ async fn keeps_the_live_file_when_it_is_the_newest_rotation() {
 #[tokio::test]
 async fn keeps_an_incomplete_live_file_even_if_a_newer_file_exists() {
     let dir = tempdir().unwrap();
-    let pod = dir.path().join("default/uid/app");
+    let pod = recording_dir(dir.path(), "kube-pod-uid");
     fs::create_dir_all(&pod).unwrap();
     let live = write_open_tail();
     let path0 = pod.join("profile-0.jfr");
     fs::write(&path0, &live).unwrap();
     fs::write(pod.join("profile-1.jfr"), write_closed_chunk()).unwrap();
     let state = Arc::new(Mutex::new(CollectorState::default()));
-    let identity = identity_from_path(dir.path(), &path0).unwrap();
+    let identity = identity_from_recording_path(&path0, "jafra-recordings").unwrap();
     {
         let mut locked = state.lock().await;
         let file = locked.file_mut(&path0, identity);
@@ -119,14 +125,14 @@ async fn keeps_an_incomplete_live_file_even_if_a_newer_file_exists() {
 #[tokio::test]
 async fn log_only_mode_never_deletes_source_files() {
     let dir = tempdir().unwrap();
-    let pod = dir.path().join("default/uid/app");
+    let pod = recording_dir(dir.path(), "kube-pod-uid");
     fs::create_dir_all(&pod).unwrap();
     let bytes = write_closed_chunk();
     let path0 = pod.join("profile-0.jfr");
     fs::write(&path0, &bytes).unwrap();
     fs::write(pod.join("profile-1.jfr"), write_closed_chunk()).unwrap();
     let state = Arc::new(Mutex::new(CollectorState::default()));
-    let identity = identity_from_path(dir.path(), &path0).unwrap();
+    let identity = identity_from_recording_path(&path0, "jafra-recordings").unwrap();
     {
         let mut locked = state.lock().await;
         let file = locked.file_mut(&path0, identity);
@@ -142,14 +148,14 @@ async fn log_only_mode_never_deletes_source_files() {
 #[tokio::test]
 async fn rejected_files_are_not_deleted() {
     let dir = tempdir().unwrap();
-    let pod = dir.path().join("default/uid/app");
+    let pod = recording_dir(dir.path(), "kube-pod-uid");
     fs::create_dir_all(&pod).unwrap();
     let bytes = write_closed_chunk();
     let path0 = pod.join("profile-0.jfr");
     fs::write(&path0, &bytes).unwrap();
     fs::write(pod.join("profile-1.jfr"), write_closed_chunk()).unwrap();
     let state = Arc::new(Mutex::new(CollectorState::default()));
-    let identity = identity_from_path(dir.path(), &path0).unwrap();
+    let identity = identity_from_recording_path(&path0, "jafra-recordings").unwrap();
     {
         let mut locked = state.lock().await;
         let file = locked.file_mut(&path0, identity);
@@ -166,7 +172,7 @@ async fn rejected_files_are_not_deleted() {
 #[tokio::test]
 async fn concurrent_reclaim_deletes_a_closed_file_once() {
     let dir = tempdir().unwrap();
-    let pod = dir.path().join("default/uid/app");
+    let pod = recording_dir(dir.path(), "kube-pod-uid");
     fs::create_dir_all(&pod).unwrap();
     let older = write_closed_chunk();
     let path0 = pod.join("profile-0.jfr");
@@ -174,7 +180,7 @@ async fn concurrent_reclaim_deletes_a_closed_file_once() {
     fs::write(pod.join("profile-1.jfr"), write_closed_chunk()).unwrap();
 
     let state = Arc::new(Mutex::new(CollectorState::default()));
-    let identity = identity_from_path(dir.path(), &path0).unwrap();
+    let identity = identity_from_recording_path(&path0, "jafra-recordings").unwrap();
     {
         let mut locked = state.lock().await;
         let file = locked.file_mut(&path0, identity);

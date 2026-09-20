@@ -22,10 +22,31 @@ pub enum PathError {
 }
 
 pub fn identity_from_path(root: &Path, path: &Path) -> Result<RecordingIdentity, PathError> {
-    let canonical_root = root;
     let relative = path
-        .strip_prefix(canonical_root)
+        .strip_prefix(root)
         .map_err(|_| PathError::OutsideRoot(path.display().to_string()))?;
+    identity_from_relative_layout(relative, path)
+}
+
+pub fn kubelet_volume_marker(volume_name: &str) -> String {
+    format!("kubernetes.io~empty-dir/{volume_name}/")
+}
+
+pub fn recording_volume_relative_path(volume_name: &str) -> String {
+    format!("volumes/kubernetes.io~empty-dir/{volume_name}")
+}
+
+pub fn identity_from_recording_path(path: &Path, volume_name: &str) -> Result<RecordingIdentity, PathError> {
+    let marker = kubelet_volume_marker(volume_name);
+    let path_str = path.to_string_lossy();
+    let relative = path_str
+        .split_once(&marker)
+        .map(|(_, suffix)| suffix)
+        .ok_or_else(|| PathError::InvalidLayout(path.display().to_string()))?;
+    identity_from_relative_layout(Path::new(relative), path)
+}
+
+fn identity_from_relative_layout(relative: &Path, full_path: &Path) -> Result<RecordingIdentity, PathError> {
     let parts: Vec<_> = relative
         .components()
         .filter_map(|component| match component {
@@ -35,7 +56,7 @@ pub fn identity_from_path(root: &Path, path: &Path) -> Result<RecordingIdentity,
         })
         .collect();
     if parts.len() != 4 {
-        return Err(PathError::InvalidLayout(path.display().to_string()));
+        return Err(PathError::InvalidLayout(full_path.display().to_string()));
     }
     for part in &parts {
         validate_component(part)?;
@@ -47,7 +68,7 @@ pub fn identity_from_path(root: &Path, path: &Path) -> Result<RecordingIdentity,
         container: parts[2].clone(),
         filename: parts[3].clone(),
     };
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = full_path.parent() {
         identity.pod_name = load_pod_name(parent).unwrap_or_default();
     }
     Ok(identity)
@@ -102,6 +123,18 @@ pub fn file_sequence(filename: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_kubelet_emptydir_path() {
+        let path = Path::new(
+            "/var/lib/kubelet/pods/abc-uid/volumes/kubernetes.io~empty-dir/jafra-recordings/default/pod-uid/auth-cache/profile-0.jfr",
+        );
+        let identity = identity_from_recording_path(path, "jafra-recordings").unwrap();
+        assert_eq!(identity.namespace, "default");
+        assert_eq!(identity.pod_uid, "pod-uid");
+        assert_eq!(identity.container, "auth-cache");
+        assert_eq!(identity.filename, "profile-0.jfr");
+    }
 
     #[test]
     fn extracts_controlled_path() {

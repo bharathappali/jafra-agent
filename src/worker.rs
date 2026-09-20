@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -9,37 +11,64 @@ use crate::discovery::discover_jfr_files;
 use crate::jfr::header::HEADER_SIZE;
 use crate::jfr::scanner::{scan_file, FinalizedChunk};
 use crate::metrics::Metrics;
-use crate::path::identity_from_path;
+use crate::path::identity_from_recording_path;
 use crate::state::{ChunkKey, CollectorState};
 use crate::transport::{Transport, TransportResult};
+use crate::watcher::{RecordingWatcher, WatchWake};
+
+/// Minimum spacing between watcher-overflow full rescans. Without this, inotify
+/// overflow on the kubelet pod tree can trigger rescans as fast as the worker
+/// loop can run and peg CPU at the cgroup limit on every node.
+const MIN_OVERFLOW_RESCAN_INTERVAL: Duration = Duration::from_secs(1);
+const MIN_POD_TREE_SYNC_INTERVAL: Duration = Duration::from_millis(500);
 
 pub async fn run_collector(
     config: Config,
     state: Arc<Mutex<CollectorState>>,
     metrics: Arc<Metrics>,
     transport: Arc<dyn Transport>,
-    mut wakes: mpsc::Receiver<crate::watcher::WatchWake>,
+    watcher: Arc<std::sync::Mutex<RecordingWatcher>>,
+    mut wakes: mpsc::Receiver<WatchWake>,
 ) {
     let readers = Arc::new(Semaphore::new(config.max_active_readers));
     let in_flight = Arc::new(Semaphore::new(config.max_in_flight_chunks));
-    rescan(&config, &state, &metrics).await;
+    rescan(&config, &state, &metrics, &watcher).await;
     let mut rescan_interval = tokio::time::interval(config.rescan_interval);
     let mut worker_tick = tokio::time::interval(Duration::from_millis(200));
+    let mut last_overflow_rescan = Instant::now()
+        .checked_sub(MIN_OVERFLOW_RESCAN_INTERVAL)
+        .unwrap_or_else(Instant::now);
+    let mut last_pod_tree_sync = Instant::now()
+        .checked_sub(MIN_POD_TREE_SYNC_INTERVAL)
+        .unwrap_or_else(Instant::now);
 
     loop {
         tokio::select! {
             _ = rescan_interval.tick() => {
-                rescan(&config, &state, &metrics).await;
+                rescan(&config, &state, &metrics, &watcher).await;
             }
             wake = wakes.recv() => {
-                match wake {
-                    Some(crate::watcher::WatchWake::Overflow) | None => {
-                        metrics.inc(&metrics.watcher_overflows);
-                        rescan(&config, &state, &metrics).await;
+                let Some(batch) = recv_coalesced_wakes(wake, &mut wakes) else {
+                    metrics.inc(&metrics.watcher_overflows);
+                    rescan(&config, &state, &metrics, &watcher).await;
+                    continue;
+                };
+                if batch.overflow {
+                    metrics.inc(&metrics.watcher_overflows);
+                    let now = Instant::now();
+                    if now.duration_since(last_overflow_rescan) >= MIN_OVERFLOW_RESCAN_INTERVAL {
+                        last_overflow_rescan = now;
+                        rescan(&config, &state, &metrics, &watcher).await;
                     }
-                    Some(crate::watcher::WatchWake::Path(path)) => {
-                        scan_one(&config, &state, &metrics, path).await;
+                } else if batch.pod_tree {
+                    let now = Instant::now();
+                    if now.duration_since(last_pod_tree_sync) >= MIN_POD_TREE_SYNC_INTERVAL {
+                        last_pod_tree_sync = now;
+                        sync_watches(&watcher, &metrics);
                     }
+                }
+                for path in batch.recording_paths {
+                    scan_one(&config, &state, &metrics, path).await;
                 }
             }
             _ = worker_tick.tick() => {
@@ -57,9 +86,60 @@ pub async fn run_collector(
     }
 }
 
-pub async fn rescan(config: &Config, state: &Arc<Mutex<CollectorState>>, metrics: &Arc<Metrics>) {
+struct CoalescedWakes {
+    overflow: bool,
+    pod_tree: bool,
+    recording_paths: Vec<PathBuf>,
+}
+
+fn recv_coalesced_wakes(
+    first: Option<WatchWake>,
+    wakes: &mut mpsc::Receiver<WatchWake>,
+) -> Option<CoalescedWakes> {
+    let first = first?;
+    let mut batch = CoalescedWakes {
+        overflow: false,
+        pod_tree: false,
+        recording_paths: Vec::new(),
+    };
+    let mut paths = HashSet::new();
+    let mut absorb = |wake: WatchWake| match wake {
+        WatchWake::Overflow => batch.overflow = true,
+        WatchWake::PodTreeChange => batch.pod_tree = true,
+        WatchWake::RecordingPath(path) => {
+            paths.insert(path);
+        }
+    };
+    absorb(first);
+    while let Ok(wake) = wakes.try_recv() {
+        absorb(wake);
+    }
+    batch.recording_paths = paths.into_iter().collect();
+    Some(batch)
+}
+
+fn sync_watches(watcher: &Arc<std::sync::Mutex<RecordingWatcher>>, metrics: &Arc<Metrics>) {
+    let Ok(mut locked) = watcher.lock() else {
+        return;
+    };
+    if let Err(error) = locked.sync_volume_roots() {
+        tracing::warn!(error = %error, "failed to sync recording volume watches");
+    }
+    metrics.set(
+        &metrics.active_volume_watches,
+        locked.active_watch_count() as u64,
+    );
+}
+
+pub async fn rescan(
+    config: &Config,
+    state: &Arc<Mutex<CollectorState>>,
+    metrics: &Arc<Metrics>,
+    watcher: &Arc<std::sync::Mutex<RecordingWatcher>>,
+) {
+    sync_watches(watcher, metrics);
     metrics.inc(&metrics.full_rescans);
-    let files = match discover_jfr_files(&config.recording_root) {
+    let files = match discover_jfr_files(&config.recording_root, &config.recording_volume_name) {
         Ok(files) => files,
         Err(error) => {
             tracing::error!(error = %error, "failed to discover JFR files");
@@ -67,6 +147,15 @@ pub async fn rescan(config: &Config, state: &Arc<Mutex<CollectorState>>, metrics
         }
     };
     metrics.set(&metrics.files_discovered, files.len() as u64);
+    if files.is_empty() {
+        tracing::debug!(root = %config.recording_root.display(), "rescan found no JFR files");
+    } else {
+        tracing::info!(
+            event = "jafra_rescan",
+            files = files.len(),
+            "discovered JFR recordings"
+        );
+    }
     let existing = files.iter().cloned().collect();
     {
         let mut locked = state.lock().await;
@@ -85,7 +174,7 @@ async fn scan_one(
 ) {
     if path.extension().and_then(|ext| ext.to_str()) != Some("jfr") {
         if path.is_dir() {
-            if let Ok(files) = discover_jfr_files(&path) {
+            if let Ok(files) = crate::discovery::discover_jfr_files_under(&path) {
                 for child in files {
                     Box::pin(scan_one(config, state, metrics, child)).await;
                 }
@@ -93,7 +182,7 @@ async fn scan_one(
         }
         return;
     }
-    let identity = match identity_from_path(&config.recording_root, &path) {
+    let identity = match identity_from_recording_path(&path, &config.recording_volume_name) {
         Ok(identity) => identity,
         Err(error) => {
             tracing::debug!(error = %error, path = %path.display(), "skipping unmanaged path");
@@ -271,7 +360,7 @@ pub async fn try_reclaim_closed_sources(
     }
     let candidates = state.lock().await.claim_reclaim_candidates();
     for path in candidates {
-        if crate::path::identity_from_path(&config.recording_root, &path).is_err()
+        if identity_from_recording_path(&path, &config.recording_volume_name).is_err()
             || !crate::state::has_newer_rotated_sibling(&path).unwrap_or(false)
         {
             state.lock().await.release_reclaim(&path);
@@ -336,5 +425,21 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(backoff_delay(&config, 10), Duration::from_secs(4));
+    }
+
+    #[test]
+    fn coalesces_watcher_wakes() {
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.try_send(WatchWake::RecordingPath(PathBuf::from("/a/profile-0.jfr")))
+            .unwrap();
+        tx.try_send(WatchWake::RecordingPath(PathBuf::from("/a/profile-0.jfr")))
+            .unwrap();
+        tx.try_send(WatchWake::PodTreeChange).unwrap();
+        tx.try_send(WatchWake::Overflow).unwrap();
+
+        let batch = recv_coalesced_wakes(rx.blocking_recv(), &mut rx).unwrap();
+        assert!(batch.overflow);
+        assert!(batch.pod_tree);
+        assert_eq!(batch.recording_paths.len(), 1);
     }
 }
